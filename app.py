@@ -1,6 +1,7 @@
 import concurrent.futures
 import io
 import math
+import time
 
 import requests
 import streamlit as st
@@ -129,53 +130,71 @@ HIGHWAY_ASSUMPTION = {
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
+OVERPASS_HEADERS = {
+    "Accept": "*/*",
+    "User-Agent": "yama-land-scout/0.2 (personal use, 2032 yama base project; https://github.com/yasumoco-ai/yama-land-scout)",
+}
+OVERPASS_BUDGET_SEC = 30  # 1回の調査で、道路データの取得にかける時間の上限
+
+
+class RoadFetchError(Exception):
+    """道路データのサーバーから取得できなかった(理由つき)。キャッシュされない。"""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_roads(lat: float, lon: float):
+    """周辺の道路(way)を返す。取得できなければ RoadFetchError。
+    成功した結果だけが24時間キャッシュされる(失敗は保存しない)。"""
+    started = time.monotonic()
+    errors = []
+    for radius in (100, 300, 800):
+        query = f"[out:json][timeout:20];way(around:{radius},{lat},{lon})[highway];out tags geom;"
+        data = None
+        for attempt in range(2):  # 全サーバーを1巡して、だめなら少し待ってもう1巡
+            for endpoint in OVERPASS_ENDPOINTS:
+                if time.monotonic() - started > OVERPASS_BUDGET_SEC:
+                    break
+                host = endpoint.split("/")[2]
+                try:
+                    r = requests.post(endpoint, data={"data": query}, timeout=15, headers=OVERPASS_HEADERS)
+                except requests.Timeout:
+                    errors.append(f"{host}: 時間切れ")
+                    continue
+                except requests.RequestException:
+                    errors.append(f"{host}: 接続できません")
+                    continue
+                if r.status_code != 200:
+                    errors.append(f"{host}: HTTP {r.status_code}")
+                    continue
+                try:
+                    data = r.json()
+                except ValueError:
+                    errors.append(f"{host}: 応答を読めません")
+                    continue
+                break
+            if data is not None or time.monotonic() - started > OVERPASS_BUDGET_SEC:
+                break
+            time.sleep(3)
+        if data is None:
+            raise RoadFetchError(" / ".join(dict.fromkeys(errors)) or "理由不明")
+        elements = data.get("elements", [])
+        if elements:
+            return elements
+    return []  # サーバーは応答したが、半径800m以内に道路がなかった
 
 
 def get_road_access(lat: float, lon: float):
     m_per_lat = 111320
     m_per_lon = 111320 * math.cos(math.radians(lat))
-    elements = []
-    errors = []  # 取得できなかった理由(サーバーごと)
-    answered = False  # どこかのサーバーが正常に応答したか
-    for radius in (100, 300, 800):
-        query = f"[out:json][timeout:20];way(around:{radius},{lat},{lon})[highway];out tags geom;"
-        data = None
-        for endpoint in OVERPASS_ENDPOINTS:
-            host = endpoint.split("/")[2]
-            try:
-                r = requests.post(
-                    endpoint, data={"data": query}, timeout=25,
-                    headers={
-                        "Accept": "*/*",
-                        "User-Agent": "yama-land-scout/0.1 (personal use, 2032 yama base project)",
-                    },
-                )
-            except requests.Timeout:
-                errors.append(f"{host}: 時間切れ")
-                continue
-            except requests.RequestException:
-                errors.append(f"{host}: 接続できません")
-                continue
-            if r.status_code != 200:
-                errors.append(f"{host}: HTTP {r.status_code}")
-                continue
-            try:
-                data = r.json()
-            except ValueError:
-                errors.append(f"{host}: 応答を読めません")
-                continue
-            answered = True
-            break
-        elements = (data or {}).get("elements", [])
-        if elements:
-            break
+    try:
+        elements = fetch_roads(round(lat, 4), round(lon, 4))
+    except RoadFetchError as e:
+        return {"road_status": "取得できませんでした", "detail": f"道路データのサーバーから取得できませんでした。時間をおいて再試行してください。(理由: {e})"}
     if not elements:
-        if answered:
-            return {"road_status": "道路データなし", "detail": "OpenStreetMapは応答しましたが、半径800m以内に道路データがありませんでした"}
-        reason = " / ".join(dict.fromkeys(errors)) or "理由不明"
-        return {"road_status": "取得できませんでした", "detail": f"道路データのサーバーから取得できませんでした。時間をおいて再試行してください。(理由: {reason})"}
+        return {"road_status": "道路データなし", "detail": "OpenStreetMapは応答しましたが、半径800m以内に道路データがありませんでした"}
 
     px, py = lon * m_per_lon, lat * m_per_lat
     best_dist, best_way = float("inf"), None
