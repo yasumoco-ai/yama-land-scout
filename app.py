@@ -137,10 +137,13 @@ def get_road_access(lat: float, lon: float):
     m_per_lat = 111320
     m_per_lon = 111320 * math.cos(math.radians(lat))
     elements = []
+    errors = []  # 取得できなかった理由(サーバーごと)
+    answered = False  # どこかのサーバーが正常に応答したか
     for radius in (100, 300, 800):
         query = f"[out:json][timeout:20];way(around:{radius},{lat},{lon})[highway];out tags geom;"
         data = None
         for endpoint in OVERPASS_ENDPOINTS:
+            host = endpoint.split("/")[2]
             try:
                 r = requests.post(
                     endpoint, data={"data": query}, timeout=25,
@@ -149,15 +152,30 @@ def get_road_access(lat: float, lon: float):
                         "User-Agent": "yama-land-scout/0.1 (personal use, 2032 yama base project)",
                     },
                 )
-                data = r.json()
-                break
-            except Exception:
+            except requests.Timeout:
+                errors.append(f"{host}: 時間切れ")
                 continue
+            except requests.RequestException:
+                errors.append(f"{host}: 接続できません")
+                continue
+            if r.status_code != 200:
+                errors.append(f"{host}: HTTP {r.status_code}")
+                continue
+            try:
+                data = r.json()
+            except ValueError:
+                errors.append(f"{host}: 応答を読めません")
+                continue
+            answered = True
+            break
         elements = (data or {}).get("elements", [])
         if elements:
             break
     if not elements:
-        return {"road_status": "道路データなし", "detail": "近隣に道路データが見つかりませんでした(OpenStreetMapサーバー混雑の可能性、時間をおいて再試行してください)"}
+        if answered:
+            return {"road_status": "道路データなし", "detail": "OpenStreetMapは応答しましたが、半径800m以内に道路データがありませんでした"}
+        reason = " / ".join(dict.fromkeys(errors)) or "理由不明"
+        return {"road_status": "取得できませんでした", "detail": f"道路データのサーバーから取得できませんでした。時間をおいて再試行してください。(理由: {reason})"}
 
     px, py = lon * m_per_lon, lat * m_per_lat
     best_dist, best_way = float("inf"), None
