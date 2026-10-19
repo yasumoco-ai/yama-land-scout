@@ -186,7 +186,7 @@ def fetch_roads(lat: float, lon: float):
     return []  # サーバーは応答したが、半径800m以内に道路がなかった
 
 
-def get_road_access(lat: float, lon: float):
+def road_from_overpass(lat: float, lon: float):
     m_per_lat = 111320
     m_per_lon = 111320 * math.cos(math.radians(lat))
     try:
@@ -223,6 +223,124 @@ def get_road_access(lat: float, lon: float):
         "distance_m": round(best_dist), "road_type": highway,
         "width_estimate": width_guess, "detail": note,
     }
+
+
+GSI_VT_URL = "https://cyberjapandata.gsi.go.jp/xyz/experimental_bvmap/{z}/{x}/{y}.pbf"
+GSI_VT_ZOOM = 16
+RD_CTG = {0: "国道", 1: "都道府県道", 2: "市区町村道", 3: "高速自動車国道等", 5: "その他", 6: "不明"}
+# 国土地理院「地物等の属性一覧」の rnkWidth(幅員の区分)
+RNK_WIDTH = {
+    0: "3m未満", 1: "3m以上5.5m未満", 2: "5.5m以上13m未満",
+    3: "13m以上19.5m未満", 4: "19.5m以上", 5: "その他", 6: "不明",
+}
+RNK_WIDTH_NOTE = {
+    0: "接道義務(4m以上)に足りない可能性があり、要確認",
+    1: "4m以上あるかは、この区分では分かりません。要確認",
+    2: "幅員の区分の上では、4m以上の見込みです",
+    3: "幅員の区分の上では、4m以上の見込みです",
+    4: "幅員の区分の上では、4m以上の見込みです",
+}
+
+
+def _tile_xy(lat: float, lon: float, z: int):
+    n = 2 ** z
+    x = (lon + 180) / 360 * n
+    y = (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n
+    return x, y
+
+
+def _tile_to_lonlat(tx: int, ty: int, px: float, py: float, extent: int, z: int):
+    n = 2 ** z
+    x, y = tx + px / extent, ty + py / extent
+    lon = x / n * 360 - 180
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    return lon, lat
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_gsi_roads_tile(z: int, x: int, y: int):
+    """国土地理院ベクトルタイル1枚から、幅員の区分つきの道路線を返す。
+    取得に失敗したら例外(キャッシュされない)。タイルが無い場所は空リスト。"""
+    import mapbox_vector_tile
+
+    r = requests.get(GSI_VT_URL.format(z=z, x=x, y=y), timeout=15, headers=OVERPASS_HEADERS)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    layers = mapbox_vector_tile.decode(r.content, default_options={"y_coord_down": True})
+    layer = layers.get("road")
+    if not layer:
+        return []
+    extent = layer.get("extent", 4096)
+    lines = []
+    for f in layer["features"]:
+        props = f["properties"]
+        if "rnkWidth" not in props:  # 道路中心線(幅員の区分があるもの)だけを使う
+            continue
+        geom = f["geometry"]
+        parts = geom["coordinates"] if geom["type"] == "MultiLineString" else [geom["coordinates"]]
+        for part in parts:
+            pts = [_tile_to_lonlat(x, y, px, py, extent, z) for px, py in part]
+            if len(pts) >= 2:
+                lines.append({"pts": pts, "rdCtg": props.get("rdCtg"), "rnkWidth": props.get("rnkWidth"), "width": props.get("Width")})
+    return lines
+
+
+def road_from_gsi(lat: float, lon: float):
+    """国土地理院ベクトルタイルで、最寄りの道路を調べる。(結果 or None, 理由メモ)"""
+    fx, fy = _tile_xy(lat, lon, GSI_VT_ZOOM)
+    cx, cy = int(fx), int(fy)
+    coords = [(cx + dx, cy + dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+    lines, failed = [], 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as ex:
+        futs = [ex.submit(fetch_gsi_roads_tile, GSI_VT_ZOOM, x, y) for x, y in coords]
+        for fut in futs:
+            try:
+                lines.extend(fut.result())
+            except Exception:
+                failed += 1
+    if failed == len(coords):
+        return None, "国土地理院のデータを取得できませんでした"
+    m_per_lat = 111320
+    m_per_lon = 111320 * math.cos(math.radians(lat))
+    px, py = lon * m_per_lon, lat * m_per_lat
+    best_dist, best = float("inf"), None
+    for ln in lines:
+        pts = ln["pts"]
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i][0] * m_per_lon, pts[i][1] * m_per_lat
+            bx, by = pts[i + 1][0] * m_per_lon, pts[i + 1][1] * m_per_lat
+            dx, dy = bx - ax, by - ay
+            len_sq = dx * dx + dy * dy
+            t = 0 if len_sq == 0 else max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / len_sq))
+            d = math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+            if d < best_dist:
+                best_dist, best = d, ln
+    if best is None:
+        return None, "国土地理院のデータに、周辺の道路(幅員の区分つき)がありませんでした" + ("(一部のタイルは取得できず)" if failed else "")
+    rank = best["rnkWidth"]
+    width_label = RNK_WIDTH.get(rank, "不明")
+    detail = RNK_WIDTH_NOTE.get(rank, "幅員の区分が不明なため、要確認")
+    if best.get("width"):
+        detail += f"(実幅員の記載: {best['width']}m)"
+    detail += "。出典: 国土地理院ベクトルタイル提供実験"
+    return {
+        "distance_m": round(best_dist), "road_type": RD_CTG.get(best["rdCtg"], "不明"),
+        "width_estimate": f"幅員の区分: {width_label}({RD_CTG.get(best['rdCtg'], '種類不明')})", "detail": detail,
+    }, ""
+
+
+def get_road_access(lat: float, lon: float):
+    """接道: 国土地理院を先に使い、取れなければOpenStreetMap(Overpass)で調べる。"""
+    gsi, gsi_note = road_from_gsi(lat, lon)
+    if gsi:
+        return gsi
+    osm = road_from_overpass(lat, lon)
+    if "distance_m" in osm:
+        osm["detail"] += "。出典: OpenStreetMap(国土地理院のデータでは見つかりませんでした)"
+        return osm
+    osm["detail"] = f"{gsi_note}。" + osm.get("detail", "")
+    return osm
 
 
 COMPASS = [(0, "北"), (45, "北東"), (90, "東"), (135, "南東"), (180, "南"), (225, "南西"), (270, "西"), (315, "北西")]
@@ -391,6 +509,6 @@ if go and address:
                     unsafe_allow_html=True,
                 )
 
-            st.caption("国土地理院・OpenStreetMap(Overpass API)・国交省ハザードマップポータルの公開データによる簡易評価です。正式な建築可否・接道義務の判定は自治体窓口での確認が別途必要です。地目・都市計画区域・河川距離の判定は今後のバージョンで対応予定です。")
+            st.caption("国土地理院(ベクトルタイル提供実験を含む)・OpenStreetMap(Overpass API。© OpenStreetMap contributors)・国交省ハザードマップポータルの公開データによる簡易評価です。正式な建築可否・接道義務の判定は自治体窓口での確認が別途必要です。地目・都市計画区域・河川距離の判定は今後のバージョンで対応予定です。")
 
 st.markdown('<div class="scout-footer">制作監督　波を出す</div>', unsafe_allow_html=True)
