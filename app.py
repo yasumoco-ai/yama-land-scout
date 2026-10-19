@@ -509,6 +509,6 @@ if go and address:
                     unsafe_allow_html=True,
                 )
 
-            st.caption("国土地理院(ベクトルタイル提供実験を含む)・OpenStreetMap(Overpass API。© OpenStreetMap contributors)・国交省ハザードマップポータルの公開データによる簡易評価です。正式な建築可否・接道義務の判定は自治体窓口での確認が別途必要です。地目・都市計画区域・河川距離の判定は今後のバージョンで対応予定です。")
+            st.caption("国土地理院(ベクトルタイル提供実験を含む)・OpenStreetMap(Overpass API。© OpenStreetMap contributors)・国交省ハザードマップポータルの公開データによる簡易評価です。正式な建築可否・接道義務の判定は自治体窓口での確認が別途必要です。山奥の細い道や私道は、道路データに載っていないことがあります。道路が表示されないことは、道がないことを意味しません。地目・都市計画区域・河川距離の判定は今後のバージョンで対応予定です。")
 
 st.markdown('<div class="scout-footer">制作監督　波を出す</div>', unsafe_allow_html=True)
